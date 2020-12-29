@@ -118,6 +118,35 @@ s64 queue_set_end_of_queue(cqueue *q, bool state)
     return FSAERR_SUCCESS;
 }
 
+s64 queue_resize(cqueue *q, s64 blkmax)
+{
+    if (!q)
+    {   errprintf("q is NULL\n");
+        return FSAERR_EINVAL;
+    }
+
+    assert(pthread_mutex_lock(&q->mutex)==0);
+
+    // does not make sense to resize a queue where endofqueue is true
+    if (q->endofqueue==true)
+    { 
+        assert(pthread_mutex_unlock(&q->mutex)==0);
+        return FSAERR_ENDOFFILE;
+    }
+    
+    // wait while (queue-is-fuller than new blkmax) to let the other threads remove items first
+    while (q->blkcount >= blkmax)
+    {
+        struct timespec t=get_timeout();
+        pthread_cond_timedwait(&q->cond, &q->mutex, &t);
+    }
+    
+    q->blkmax=blkmax;
+    assert(pthread_mutex_unlock(&q->mutex)==0);
+    pthread_cond_broadcast(&q->cond);
+    return FSAERR_SUCCESS;
+}
+
 bool queue_get_end_of_queue(cqueue *q)
 {
     bool res;
@@ -217,7 +246,7 @@ s64 queue_add_block(cqueue *q, cblockinfo *blkinfo, int status)
     }
     
     // wait while (queue-is-full) to let the other threads remove items first
-    while (q->blkcount > q->blkmax)
+    while (q->blkcount >= q->blkmax)
     {
         struct timespec t=get_timeout();
         pthread_cond_timedwait(&q->cond, &q->mutex, &t);
@@ -292,7 +321,7 @@ s64 queue_add_header_internal(cqueue *q, cheadinfo *headinfo)
     }
     
     // wait while (queue-is-full) to let the other threads remove items first
-    while (q->blkcount > q->blkmax)
+    while (q->blkcount >= q->blkmax)
     {
         struct timespec t=get_timeout();
         pthread_cond_timedwait(&q->cond, &q->mutex, &t);

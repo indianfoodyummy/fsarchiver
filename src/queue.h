@@ -45,7 +45,7 @@ struct s_blockinfo // used when (type==QITEM_TYPE_BLOCK)
     u32                  blkarsize; // size of the block as it is in the archive (compressed and encrypted)
     u16                  blkcompalgo; // algo used to compressed the block
     u32                  blkcompsize; // size of the block after compression and before encryption
-    u16                  blkcryptalgo; // algo used to compressed the block
+    u16                  blkcryptalgo; // algo used to encrypt the block
     u16                  blkfsid; // id of filesystem to which the block belongs
     bool                 blklocked; // true if locked (being processed in the compress/crypt thread)
 };
@@ -98,6 +98,7 @@ s64  queue_add_header(cqueue *q, struct s_dico *d, char *magic, u16 fsid);
 s64  queue_add_header_internal(cqueue *q, cheadinfo *headinfo);
 s64  queue_replace_block(cqueue *q, s64 itemnum, cblockinfo *blkinfo, int newstatus);
 s64  queue_destroy_first_item(cqueue *q);
+s64  queue_resize(cqueue *q, s64 blkmax);
 
 // end of queue functions
 s64  queue_set_end_of_queue(cqueue *q, bool state);

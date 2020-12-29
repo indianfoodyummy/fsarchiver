@@ -37,6 +37,8 @@ struct s_options
     u32      datablocksize;
     u32      smallfilethresh;
     u64      splitsize;
+    s64      maxcacheblocks;
+    u64      maxcachemem;
     u16      encryptalgo;
     u16      fsacomplevel;
 	char     archlabel[FSA_MAX_LABELLEN];

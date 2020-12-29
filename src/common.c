@@ -62,7 +62,7 @@ void concatenate_paths(char *buffer, int maxbufsize, char *p1, char *p2)
     int i;
 
     memset(buffer, 0, maxbufsize);
-    for (i=0; (p1[i]) && (p1[i]!='/' || p1[i+1]); i++)
+    for (i=0; (p1[i]) && (p1[i]!='/' || p1[i+1]) && (i<maxbufsize-1); i++)
         *(buffer++)=p1[i];
     *(buffer++)='/';
     while (*p2=='/')
@@ -499,12 +499,12 @@ char *strlcatf(char *dest, int destbufsize, char *format, ...)
     int len1;
     
     // if buffer already full, don't cat the second string
-    if ((len1=strnlen(dest, destbufsize))==destbufsize)
+    if ((len1=strnlen(dest, destbufsize-1))==destbufsize-1)
         return dest;
     
-    // at the new formatted string at the end of the first one
+    // add the new formatted string at the end of the first one
     va_start(ap, format);
-    vsnprintf(dest+len1, destbufsize-len1, format, ap);
+    vsnprintf(dest+len1, destbufsize-len1-1, format, ap);
     va_end(ap);
     
     return dest;

@@ -24,6 +24,10 @@
 #include <signal.h>
 #include <getopt.h>
 #include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 
 #include "fsarchiver.h"
 #include "dico.h"
@@ -80,23 +84,24 @@ void usage(char *progname, bool examples)
     msgprintf(MSG_FORCE, " * archinfo: show information about an existing archive file and its contents\n");
     msgprintf(MSG_FORCE, " * probe [detailed]: show list of filesystems detected on the disks\n");
     msgprintf(MSG_FORCE, "<options>\n");
-    msgprintf(MSG_FORCE, " -o: overwrite the archive if it already exists instead of failing\n");
-    msgprintf(MSG_FORCE, " -v: verbose mode (can be used several times to increase the level of details)\n");
-    msgprintf(MSG_FORCE, " -d: debug mode (can be used several times to increase the level of details)\n");
     msgprintf(MSG_FORCE, " -A: allow to save a filesystem which is mounted in read-write (live backup)\n");
     msgprintf(MSG_FORCE, " -a: allow to save a filesystem when acls and xattrs are not supported\n");
-    msgprintf(MSG_FORCE, " -x: enable support for experimental features (they are disabled by default)\n");
+    msgprintf(MSG_FORCE, " -c <password>: encrypt/decrypt data in archive, \"-c -\" for interactive password\n");
+    msgprintf(MSG_FORCE, " -d: debug mode (can be used several times to increase the level of details)\n");
     msgprintf(MSG_FORCE, " -e <pattern>: exclude files and directories that match that pattern\n");
+    msgprintf(MSG_FORCE, " -h: show help and information about how to use fsarchiver with examples\n");
+    msgprintf(MSG_FORCE, " -j <count>: create more than one (de)compression thread. useful on multi-core cpu\n");
     msgprintf(MSG_FORCE, " -L <label>: set the label of the archive (comment about the contents)\n");
-    msgprintf(MSG_FORCE, " -z <level>: legacy compression level from 0 (very fast) to 9 (very good)\n");
+    msgprintf(MSG_FORCE, " -M <mbsize>: set the MAXIMUM size of in-memory block-caching of file content. NOTE: MINIMUM is 1MB, MAX excludes non-caching variable process variable/stack memory.\n");
+    msgprintf(MSG_FORCE, " -o: overwrite the archive if it already exists instead of failing\n");
+    msgprintf(MSG_FORCE, " -s <mbsize>: split the archive into several files of <mbsize> megabytes each\n");
+    msgprintf(MSG_FORCE, " -V: show program version and exit\n");
+    msgprintf(MSG_FORCE, " -v: verbose mode (can be used several times to increase the level of details)\n");
+    msgprintf(MSG_FORCE, " -x: enable support for experimental features (they are disabled by default)\n");
 #ifdef OPTION_ZSTD_SUPPORT
     msgprintf(MSG_FORCE, " -Z <level>: zstd compression level from 1 (very fast) to 22 (very good)\n");
 #endif // OPTION_ZSTD_SUPPORT
-    msgprintf(MSG_FORCE, " -s <mbsize>: split the archive into several files of <mbsize> megabytes each\n");
-    msgprintf(MSG_FORCE, " -j <count>: create more than one (de)compression thread. useful on multi-core cpu\n");
-    msgprintf(MSG_FORCE, " -c <password>: encrypt/decrypt data in archive, \"-c -\" for interactive password\n");
-    msgprintf(MSG_FORCE, " -h: show help and information about how to use fsarchiver with examples\n");
-    msgprintf(MSG_FORCE, " -V: show program version and exit\n");
+    msgprintf(MSG_FORCE, " -z <level>: legacy compression level from 0 (very fast) to 9 (very good)\n");
     msgprintf(MSG_FORCE, "<information>\n");
     msgprintf(MSG_FORCE, " * Support included for: lzo=%s, lzma=%s, lz4=%s, zstd=%s\n", (lzo==true)?"yes":"no", (lzma==true)?"yes":"no", (lz4==true)?"yes":"no", (zstd==true)?"yes":"no");
     msgprintf(MSG_FORCE, " * Support for ntfs filesystems is unstable: don't use it for production.\n");
@@ -143,21 +148,22 @@ void usage(char *progname, bool examples)
 
 static struct option const long_options[] =
 {
-    {"overwrite", no_argument, NULL, 'o'},
-    {"allow-no-acl-xattr", no_argument, NULL, 'a'},
     {"allow-rw-mounted", no_argument, NULL, 'A'},
-    {"verbose", no_argument, NULL, 'v'},
-    {"debug", no_argument, NULL, 'd'},
-    {"compress", required_argument, NULL, 'z'},
-    {"zstd", required_argument, NULL, 'Z'},
-    {"jobs", required_argument, NULL, 'j'},
-    {"help", no_argument, NULL, 'h'},
-    {"version", no_argument, NULL, 'V'},
-    {"split", required_argument, NULL, 's'},
+    {"allow-no-acl-xattr", no_argument, NULL, 'a'},
     {"cryptpass", required_argument, NULL, 'c'},
-    {"label", required_argument, NULL, 'L'},
+    {"debug", no_argument, NULL, 'd'},
     {"exclude", required_argument, NULL, 'e'},
+    {"help", no_argument, NULL, 'h'},
+    {"jobs", required_argument, NULL, 'j'},
+    {"label", required_argument, NULL, 'L'},
+    {"maxmemcache", required_argument, NULL, 'M'},
+    {"overwrite", no_argument, NULL, 'o'},
+    {"split", required_argument, NULL, 's'},
+    {"version", no_argument, NULL, 'V'},
+    {"verbose", no_argument, NULL, 'v'},
     {"experimental", no_argument, NULL, 'x'},
+    {"zstd", required_argument, NULL, 'Z'},
+    {"compress", required_argument, NULL, 'z'},
     {NULL, 0, NULL, 0}
 };
 
@@ -194,6 +200,8 @@ int process_cmdline(int argc, char **argv)
     g_options.encryptalgo=ENCRYPT_NONE;
     snprintf(g_options.archlabel, sizeof(g_options.archlabel), "<none>");
     g_options.encryptpass[0]=0;
+    g_options.maxcacheblocks = (s64) FSA_MAX_QUEUESIZE;
+    g_options.maxcachemem = (u64) 0;
 
     // set default compression mode
     g_options.compressalgo=FSA_DEF_COMPRESS_ALGO;
@@ -204,31 +212,37 @@ int process_cmdline(int argc, char **argv)
     g_options.fsacomplevel=FSA_DEF_FSACOMP_LEVEL;
 #endif // OPTION_ZSTD_SUPPORT
 
-    while ((c = getopt_long(argc, argv, "oaAvdj:hVs:c:L:e:xz:Z:", long_options, NULL)) != EOF)
+    while ((c = getopt_long(argc, argv, "Aac:de:hj:L:M:os:VvxZ:z:", long_options, NULL)) != EOF)
     {
         switch (c)
         {
             case 'o': // overwrite existing archives
                 g_options.overwrite=true;
                 break;
-            case 'a': // don't check the mount options for already-mounted filesystems
-                g_options.dontcheckmountopts=true;
-                break;
             case 'A': // allows to backup read/write mounted partition
                 g_options.allowsaverw=true;
                 break;
-            case 'x': // enable support for experimental features
-                g_options.experimental=true;
+            case 'a': // don't check the mount options for already-mounted filesystems
+                g_options.dontcheckmountopts=true;
                 break;
-            case 'v': // verbose mode
-                g_options.verboselevel++;
+            case 'c': // encryption
+                g_options.encryptalgo=ENCRYPT_BLOWFISH;
+                if ((strlen(optarg)<FSA_MIN_PASSLEN || strlen(optarg)>FSA_MAX_PASSLEN) && strcmp(optarg, "-")!=0)
+                {   errprintf("the password lenght is incorrect, it must between %d and %d chars, or \"-\" for interactive password prompt.\n", FSA_MIN_PASSLEN, FSA_MAX_PASSLEN);
+                    usage(progname, false);
+                    return -1;
+                }
+                snprintf((char*)g_options.encryptpass, FSA_MAX_PASSLEN, "%s", optarg);
                 break;
-            case 'V': // version
-                msgprintf(MSG_FORCE, "fsarchiver %s (%s)\n", FSA_VERSION, FSA_RELDATE);
-                return 0;
             case 'd': // debug mode
                 g_options.debuglevel++;
                 break;
+            case 'e': // exclude files/directories
+                strlist_add(&g_options.exclude, optarg);
+                break;
+            case 'h': // help
+                usage(progname, true);
+                return 0;
             case 'j': // compression jobs
                 g_options.compressjobs=atoi(optarg);
                 if (g_options.compressjobs<1 || g_options.compressjobs>FSA_MAX_COMPJOBS)
@@ -238,8 +252,11 @@ int process_cmdline(int argc, char **argv)
                     return 1;
                 }
                 break;
-            case 'e': // exclude files/directories
-                strlist_add(&g_options.exclude, optarg);
+            case 'L': // archive label
+                snprintf(g_options.archlabel, sizeof(g_options.archlabel), "%s", optarg);
+                break;
+            case 'M': // Maximum block caching memory allocation in MB
+                g_options.maxcachemem=((u64)atoll(optarg));
                 break;
             case 's': // split archive into several volumes
                 g_options.splitsize=((u64)atoll(optarg))*((u64)1024LL*1024LL);
@@ -255,23 +272,14 @@ int process_cmdline(int argc, char **argv)
                         (long long)g_options.splitsize, format_size(g_options.splitsize, tempbuf, sizeof(tempbuf), 'h'));
                 }
                 break;
-            case 'z': // legacy compression level
-                g_options.fsacomplevel=atoi(optarg);
-                if (g_options.fsacomplevel<0 || g_options.fsacomplevel>9)
-                {   errprintf("[%s] is not a valid compression level, it must be an integer between 0 and 9.\n", optarg);
-                    usage(progname, false);
-                    return -1;
-                }
-                if (options_select_compress_level(g_options.fsacomplevel)<0)
-                    return -1;
-#ifdef OPTION_ZSTD_SUPPORT
-                msgprintf(MSG_FORCE, "Legacy compression methods (-z) are deprecated.\n"
-                    "It is recommended to switch to zstd using the -Z option.\n"
-                    "Please read \"http://www.fsarchiver.org/Compression\" for more details.\n");
-#endif // OPTION_ZSTD_SUPPORT
-                if (g_options.fsacomplevel>=8)
-                    msgprintf(MSG_FORCE, "Compression levels >= 8 may require a huge amount of memory\n"
-                        "Please read the man page or \"http://www.fsarchiver.org/Compression\" for more details.\n");
+            case 'V': // version
+                msgprintf(MSG_FORCE, "fsarchiver %s (%s)\n", FSA_VERSION, FSA_RELDATE);
+                return 0;
+            case 'v': // verbose mode
+                g_options.verboselevel++;
+                break;
+            case 'x': // enable support for experimental features
+                g_options.experimental=true;
                 break;
             case 'Z': // zstd compression level
 #ifdef OPTION_ZSTD_SUPPORT
@@ -293,21 +301,24 @@ int process_cmdline(int argc, char **argv)
                 return -1;
 #endif // OPTION_ZSTD_SUPPORT
                 break;
-            case 'c': // encryption
-                g_options.encryptalgo=ENCRYPT_BLOWFISH;
-                if ((strlen(optarg)<FSA_MIN_PASSLEN || strlen(optarg)>FSA_MAX_PASSLEN) && strcmp(optarg, "-")!=0)
-                {   errprintf("the password lenght is incorrect, it must between %d and %d chars, or \"-\" for interactive password prompt.\n", FSA_MIN_PASSLEN, FSA_MAX_PASSLEN);
+            case 'z': // legacy compression level
+                g_options.fsacomplevel=atoi(optarg);
+                if (g_options.fsacomplevel<0 || g_options.fsacomplevel>9)
+                {   errprintf("[%s] is not a valid compression level, it must be an integer between 0 and 9.\n", optarg);
                     usage(progname, false);
                     return -1;
                 }
-                snprintf((char*)g_options.encryptpass, FSA_MAX_PASSLEN, "%s", optarg);
+                if (options_select_compress_level(g_options.fsacomplevel)<0)
+                    return -1;
+#ifdef OPTION_ZSTD_SUPPORT
+                msgprintf(MSG_FORCE, "Legacy compression methods (-z) are deprecated.\n"
+                    "It is recommended to switch to zstd using the -Z option.\n"
+                    "Please read \"http://www.fsarchiver.org/Compression\" for more details.\n");
+#endif // OPTION_ZSTD_SUPPORT
+                if (g_options.fsacomplevel>=8)
+                    msgprintf(MSG_FORCE, "Compression levels >= 8 may require a huge amount of memory\n"
+                        "Please read the man page or \"http://www.fsarchiver.org/Compression\" for more details.\n");
                 break;
-            case 'L': // archive label
-                snprintf(g_options.archlabel, sizeof(g_options.archlabel), "%s", optarg);
-                break;
-            case 'h': // help
-                usage(progname, true);
-                return 0;
             default:
                 usage(progname, false);
                 return -1;
@@ -326,6 +337,78 @@ int process_cmdline(int argc, char **argv)
     else // mandatory and unique parameters
     {
         command=*argv++, argc--;
+    }
+
+    // calculate max size of queue, based upon -M option
+    if (g_options.maxcachemem > 0) {
+        int memres;
+        int memfd;
+        char memdatabuf[2048];
+        char *memszstr=NULL;
+        int memszstart=0;
+        int memszend=0;
+        u64 memsztemp=0;
+        u64 memreal=0;
+    
+        memset(memdatabuf, 0, sizeof(memdatabuf));
+        // The checksum will be in the obj-header not in a file footer
+        if (((memfd=open("/proc/meminfo", O_RDONLY))<0) ||
+            ((memres=read(memfd, memdatabuf, sizeof(memdatabuf)-1 ))<16)) {   
+            errprintf("Cannot open /proc/meminfo for reading\n");
+            errprintf("Ignoring -M command-line argument\n");
+            g_options.maxcachemem = 0;
+        } else { 
+            close(memfd);
+            if (((memszstr=strcasestr(memdatabuf,"MemTotal:")) == NULL) ||
+                ((memszstart=strspn(memszstr+9," \t")) < 1) ||
+                ((memszend=strspn(memszstr+9+memszstart,"0123456789")) < 1)) {
+                   errprintf("Cannot find MemTotal value in /proc/meminfo\n");
+                   errprintf("Ignoring -M command-line argument\n");
+                   g_options.maxcachemem = 0;
+            } else {
+                 *(memszstr + 9 + memszstart + memszend)='\0';
+                 char memunit = *(memszstr + 9 + memszstart + memszend + 1);
+                 memsztemp = (u64)atoll(memszstr+9+memszstart);
+                 if (memsztemp < 1) memsztemp = 1;
+                 switch (memunit) {
+                     case 'b':
+                     case 'B':
+                         memreal = memsztemp / (u64) 1048576LL;
+                         break;
+                     case 'g':
+                     case 'G':
+                         memreal = memsztemp * (u64) 1024LL;
+                         break;
+                     case 'm':
+                     case 'M':
+                         memreal = memsztemp;
+                         break;
+                     case 'k':
+                     case 'K':
+                     default: 
+                         memreal = memsztemp / (u64)1024LL;
+                         break;
+                 };
+                 if (memreal < 1) {
+                   msgprintf(MSG_FORCE, "System real ram computing as less than 1MB?!\n");
+                   g_options.maxcachemem = 0;
+                   msgprintf(MSG_FORCE, "Ignoring -M request\n");
+                 } else if (memreal < g_options.maxcachemem) {
+                   msgprintf(MSG_FORCE, "System real ram %ldMB < -M request of %ldMB\n", memreal, g_options.maxcachemem);
+                   g_options.maxcachemem = memreal / 2;
+                   msgprintf(MSG_FORCE, "Setting -M request to %ldMB (1/2 of real memory)\n",g_options.maxcachemem);
+                 } else {
+                   u64 mbtemp1;
+                   u64 mbtemp2;
+                   mbtemp1 = (g_options.maxcachemem * (u64) 1045876);
+                   mbtemp2 = (s64) (mbtemp1 / g_options.datablocksize);
+                   msgprintf(MSG_FORCE, "System real ram calculated as %ldMB\n",memreal);
+                   msgprintf(MSG_FORCE, "Implemented -M requested block cache of size %ldMB\n",g_options.maxcachemem);
+                   g_options.maxcacheblocks = mbtemp2;
+                   queue_resize(&g_queue, g_options.maxcacheblocks);
+                 }
+            } 
+        }
     }
 
     // calculate threshold for small files that are compressed together

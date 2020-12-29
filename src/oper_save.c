@@ -742,19 +742,23 @@ int createar_save_directory(csavear *save, char *root, char *path, u64 *costeval
     struct stat64 statbuf;
     struct dirent *dir;
     DIR *dirdesc;
-    int ret=0;
+    int ret = 0;
+    char **arrayOFrelpath = NULL;
+    int arraylen = 0;
+    int arrayalloc = 0;
+    int i = 0;
     
     // init
     concatenate_paths(fulldirpath, sizeof(fulldirpath), root, path);
     
     if (!(dirdesc=opendir(fulldirpath)))
-    {   sysprintf("cannot open directory %s\n", fulldirpath);
+    {   sysprintf("cannot open directory %s, path length=%d\n", fulldirpath, (int) strlen(fulldirpath));
         return 0; // not a fatal error, oper must continue
     }
     
     // backup the directory itself (important for the root of the filesystem)
     if (lstat64(fulldirpath, &statbuf)!=0)
-    {   sysprintf("cannot lstat64(%s)\n", fulldirpath);
+    {   sysprintf("cannot lstat64(%s), path length=%d\n", fulldirpath, (int) strlen(fulldirpath));
         ret=-1;
         goto backup_dir_err;
     }
@@ -792,24 +796,52 @@ int createar_save_directory(csavear *save, char *root, char *path, u64 *costeval
             continue;
         }
         
-        // backup contents before the directory itself so that the dir-attributes are written after the dir contents
+        // add directories to a list of sub-directory names to be processed
+        // after non-directory objects in this directory
         if (S_ISDIR(statbuf.st_mode))
         { 
-            if (createar_save_directory(save, root, relpath, costeval)!=0)
-            {   msgprintf(MSG_STACK, "createar_save_directory(%s) failed\n", relpath);
-                ret=-1;
-                goto backup_dir_err;
-            }
+              if (arraylen >= arrayalloc) {
+                 int old_arrayalloc = arrayalloc;
+                 arrayalloc = arrayalloc + 1000;
+                 if ((arraylen > old_arrayalloc) ||
+                    ((arrayOFrelpath = (char **) realloc(arrayOFrelpath,(size_t) (arrayalloc*sizeof(char *)))) == NULL)) {
+                    ret=-1;
+                    goto backup_dir_err;
+                 } else {
+                    //msgprintf(MSG_FORCE,"About to extend array: arraylen=%d, arrayalloc=%d\n",arraylen, arrayalloc);
+		    for (int i=old_arrayalloc; i < arrayalloc; i++) arrayOFrelpath[i]=NULL;
+                 }
+              }
+              arraylen++;
+              arrayOFrelpath[arraylen - 1]=strndup(relpath,PATH_MAX-1);
+              //msgprintf(MSG_FORCE,"Adding Dir name to list: arrayloc=%d, string=%s\n",arraylen-1, arrayOFrelpath[arraylen-1]);
+              if (arrayOFrelpath[arraylen - 1] == NULL) {
+                  ret=-1;
+                  goto backup_dir_err;
+              }
         }
         else // not a directory
         {
             if (createar_save_file(save, root, relpath, &statbuf, costeval)!=0)
-            {   msgprintf(MSG_STACK, "createar_save_directory(%s) failed\n", relpath);
+            {   msgprintf(MSG_STACK, "createar_save_file in createar_save_directory(%s) failed\n", relpath);
                 ret=-1;
                 goto backup_dir_err;
             }
         }
     }
+    // backup contents before the directory itself so that the dir-attributes are written after the dir contents
+    for (i=0; ((i < arraylen ) && (get_interrupted()==false));i++) {
+            //msgprintf(MSG_FORCE,"About to createar_save_directory: root=%s, relpath=%s, relpath length=%d\n", root, arrayOFrelpath[i], (int) strlen(arrayOFrelpath[i]));
+            if (createar_save_directory(save, root, arrayOFrelpath[i], costeval)!=0)
+            {   msgprintf(MSG_STACK, "createar_save_directory(%s) failed\n", relpath);
+                ret=-1;
+                goto backup_dir_err;
+            }
+            free(arrayOFrelpath[i]);
+    }
+    free(arrayOFrelpath);
+    arrayOFrelpath = NULL;
+    arraylen = arrayalloc = 0;
     
 backup_dir_err:
     closedir(dirdesc);
