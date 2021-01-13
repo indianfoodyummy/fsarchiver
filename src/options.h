@@ -39,9 +39,12 @@ struct s_options
     u64      splitsize;
     s64      maxcacheblocks;
     u64      maxcachemem;
+    int      jobs_pfreader;
+    int      buffer_size_read;
+    long     buffer_size_read_bytes;
     u16      encryptalgo;
     u16      fsacomplevel;
-	char     archlabel[FSA_MAX_LABELLEN];
+    char     archlabel[FSA_MAX_LABELLEN];
     u8       encryptpass[FSA_MAX_PASSLEN+1];
     cstrlist exclude;
 };

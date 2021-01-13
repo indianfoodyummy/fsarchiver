@@ -86,20 +86,22 @@ void usage(char *progname, bool examples)
     msgprintf(MSG_FORCE, "<options>\n");
     msgprintf(MSG_FORCE, " -A: allow to save a filesystem which is mounted in read-write (live backup)\n");
     msgprintf(MSG_FORCE, " -a: allow to save a filesystem when acls and xattrs are not supported\n");
+    msgprintf(MSG_FORCE, " -B <mbsize>: set the size of PER THREAD read() request buffer, in MB. MAX is 32\n");
     msgprintf(MSG_FORCE, " -c <password>: encrypt/decrypt data in archive, \"-c -\" for interactive password\n");
     msgprintf(MSG_FORCE, " -d: debug mode (can be used several times to increase the level of details)\n");
     msgprintf(MSG_FORCE, " -e <pattern>: exclude files and directories that match that pattern\n");
     msgprintf(MSG_FORCE, " -h: show help and information about how to use fsarchiver with examples\n");
+    msgprintf(MSG_FORCE, " -J <count>: create more than one file read() thread for save commands. useful on RAID\n");
     msgprintf(MSG_FORCE, " -j <count>: create more than one (de)compression thread. useful on multi-core cpu\n");
     msgprintf(MSG_FORCE, " -L <label>: set the label of the archive (comment about the contents)\n");
-    msgprintf(MSG_FORCE, " -M <mbsize>: set the MAXIMUM size of in-memory block-caching of file content. NOTE: MINIMUM is 1MB, MAX excludes non-caching variable process variable/stack memory.\n");
+    msgprintf(MSG_FORCE, " -M <mbsize>: set the MAXIMUM size of in-memory block-caching of file content. NOTE: MINIMUM arg value is 1 (MB), and if value is > real memory, MAXIMUM is reset to 1/2 of real memory. NOTE: This arg excludes a variety of process-specific memory uses / only relates to file content caching.\n");
     msgprintf(MSG_FORCE, " -o: overwrite the archive if it already exists instead of failing\n");
     msgprintf(MSG_FORCE, " -s <mbsize>: split the archive into several files of <mbsize> megabytes each\n");
     msgprintf(MSG_FORCE, " -V: show program version and exit\n");
     msgprintf(MSG_FORCE, " -v: verbose mode (can be used several times to increase the level of details)\n");
     msgprintf(MSG_FORCE, " -x: enable support for experimental features (they are disabled by default)\n");
 #ifdef OPTION_ZSTD_SUPPORT
-    msgprintf(MSG_FORCE, " -Z <level>: zstd compression level from 1 (very fast) to 22 (very good)\n");
+    msgprintf(MSG_FORCE, " -Z <level>: zstd compression level from 1 (very fast) to 22 (very good), 0=No compression\n");
 #endif // OPTION_ZSTD_SUPPORT
     msgprintf(MSG_FORCE, " -z <level>: legacy compression level from 0 (very fast) to 9 (very good)\n");
     msgprintf(MSG_FORCE, "<information>\n");
@@ -150,10 +152,12 @@ static struct option const long_options[] =
 {
     {"allow-rw-mounted", no_argument, NULL, 'A'},
     {"allow-no-acl-xattr", no_argument, NULL, 'a'},
+    {"buffer_size_read", required_argument, NULL, 'B'},
     {"cryptpass", required_argument, NULL, 'c'},
     {"debug", no_argument, NULL, 'd'},
     {"exclude", required_argument, NULL, 'e'},
     {"help", no_argument, NULL, 'h'},
+    {"jobs_pfreader", required_argument, NULL, 'J'},
     {"jobs", required_argument, NULL, 'j'},
     {"label", required_argument, NULL, 'L'},
     {"maxmemcache", required_argument, NULL, 'M'},
@@ -195,6 +199,9 @@ int process_cmdline(int argc, char **argv)
     g_options.dontcheckmountopts=false;
     g_options.verboselevel=0;
     g_options.debuglevel=0;
+    g_options.jobs_pfreader=FSA_DEF_THREAD_OPEN_FD;
+    g_options.buffer_size_read=FSA_DEF_THREAD_READ_BUFSIZE;
+    g_options.buffer_size_read_bytes=FSA_DEF_THREAD_READ_BUFSIZE * 1048576;
     g_options.compressjobs=1;
     g_options.datablocksize=FSA_DEF_BLKSIZE;
     g_options.encryptalgo=ENCRYPT_NONE;
@@ -212,7 +219,7 @@ int process_cmdline(int argc, char **argv)
     g_options.fsacomplevel=FSA_DEF_FSACOMP_LEVEL;
 #endif // OPTION_ZSTD_SUPPORT
 
-    while ((c = getopt_long(argc, argv, "Aac:de:hj:L:M:os:VvxZ:z:", long_options, NULL)) != EOF)
+    while ((c = getopt_long(argc, argv, "AaB:c:de:hJ:j:L:M:os:VvxZ:z:", long_options, NULL)) != EOF)
     {
         switch (c)
         {
@@ -224,6 +231,15 @@ int process_cmdline(int argc, char **argv)
                 break;
             case 'a': // don't check the mount options for already-mounted filesystems
                 g_options.dontcheckmountopts=true;
+                break;
+            case 'B': // set the size of the per-thread read() buffer for savefs and savedir
+                g_options.buffer_size_read = atoi(optarg);
+                if (g_options.buffer_size_read<1 || g_options.buffer_size_read>FSA_MAX_THREAD_READ_BUFSIZE)
+                {
+                    errprintf("[%s] is not a valid PER-THREAD read() buffer size in MB. Must be between 1 and %d\n", optarg, FSA_MAX_THREAD_READ_BUFSIZE);
+                    usage(progname, false);
+                    return 1;
+                }
                 break;
             case 'c': // encryption
                 g_options.encryptalgo=ENCRYPT_BLOWFISH;
@@ -243,6 +259,15 @@ int process_cmdline(int argc, char **argv)
             case 'h': // help
                 usage(progname, true);
                 return 0;
+            case 'J': // file reader/writer jobs
+                g_options.jobs_pfreader=atoi(optarg);
+                if (g_options.jobs_pfreader<1 || g_options.jobs_pfreader>FSA_MAX_THREAD_OPEN_FD)
+                {
+                    errprintf("[%s] is not a valid number of jobs. Must be between 1 and %d\n", optarg, FSA_MAX_THREAD_OPEN_FD);
+                    usage(progname, false);
+                    return 1;
+                }
+                break;
             case 'j': // compression jobs
                 g_options.compressjobs=atoi(optarg);
                 if (g_options.compressjobs<1 || g_options.compressjobs>FSA_MAX_COMPJOBS)
@@ -283,11 +308,16 @@ int process_cmdline(int argc, char **argv)
                 break;
             case 'Z': // zstd compression level
 #ifdef OPTION_ZSTD_SUPPORT
-                g_options.compressalgo=COMPRESS_ZSTD;
                 g_options.compresslevel=atoi(optarg);
-                g_options.fsacomplevel=atoi(optarg);
-                if (g_options.compresslevel<1 || g_options.compresslevel>22)
-                {   errprintf("[%s] is not a valid compression level, it must be an integer between 1 and 22.\n", optarg);
+                if (g_options.compresslevel == 0) {
+                    g_options.compressalgo=COMPRESS_NONE;
+                    g_options.fsacomplevel=COMPRESS_LZ4;
+                } else {
+                    g_options.compressalgo=COMPRESS_ZSTD;
+                    g_options.fsacomplevel=atoi(optarg);
+                }
+                if (g_options.compresslevel<0 || g_options.compresslevel>22)
+                {   errprintf("[%s] is not a valid compression level, it must be an integer between 0 and 22.\n", optarg);
                     usage(progname, false);
                     return -1;
                 }
@@ -339,76 +369,107 @@ int process_cmdline(int argc, char **argv)
         command=*argv++, argc--;
     }
 
-    // calculate max size of queue, based upon -M option
-    if (g_options.maxcachemem > 0) {
-        int memres;
-        int memfd;
-        char memdatabuf[2048];
-        char *memszstr=NULL;
-        int memszstart=0;
-        int memszend=0;
-        u64 memsztemp=0;
-        u64 memreal=0;
+    int memres;
+    int memfd;
+    char memdatabuf[2048];
+    char *memszstr=NULL;
+    int memszstart=0;
+    int memszend=0;
+    u64 memsztemp=0;
+    u64 memreal=0;
+    bool memerr=false;
     
-        memset(memdatabuf, 0, sizeof(memdatabuf));
-        // The checksum will be in the obj-header not in a file footer
-        if (((memfd=open("/proc/meminfo", O_RDONLY))<0) ||
-            ((memres=read(memfd, memdatabuf, sizeof(memdatabuf)-1 ))<16)) {   
-            errprintf("Cannot open /proc/meminfo for reading\n");
-            errprintf("Ignoring -M command-line argument\n");
-            g_options.maxcachemem = 0;
-        } else { 
-            close(memfd);
-            if (((memszstr=strcasestr(memdatabuf,"MemTotal:")) == NULL) ||
-                ((memszstart=strspn(memszstr+9," \t")) < 1) ||
-                ((memszend=strspn(memszstr+9+memszstart,"0123456789")) < 1)) {
-                   errprintf("Cannot find MemTotal value in /proc/meminfo\n");
-                   errprintf("Ignoring -M command-line argument\n");
-                   g_options.maxcachemem = 0;
-            } else {
-                 *(memszstr + 9 + memszstart + memszend)='\0';
-                 char memunit = *(memszstr + 9 + memszstart + memszend + 1);
-                 memsztemp = (u64)atoll(memszstr+9+memszstart);
-                 if (memsztemp < 1) memsztemp = 1;
-                 switch (memunit) {
-                     case 'b':
-                     case 'B':
-                         memreal = memsztemp / (u64) 1048576LL;
-                         break;
-                     case 'g':
-                     case 'G':
-                         memreal = memsztemp * (u64) 1024LL;
-                         break;
-                     case 'm':
-                     case 'M':
-                         memreal = memsztemp;
-                         break;
-                     case 'k':
-                     case 'K':
-                     default: 
-                         memreal = memsztemp / (u64)1024LL;
-                         break;
-                 };
-                 if (memreal < 1) {
-                   msgprintf(MSG_FORCE, "System real ram computing as less than 1MB?!\n");
-                   g_options.maxcachemem = 0;
-                   msgprintf(MSG_FORCE, "Ignoring -M request\n");
-                 } else if (memreal < g_options.maxcachemem) {
-                   msgprintf(MSG_FORCE, "System real ram %ldMB < -M request of %ldMB\n", memreal, g_options.maxcachemem);
-                   g_options.maxcachemem = memreal / 2;
-                   msgprintf(MSG_FORCE, "Setting -M request to %ldMB (1/2 of real memory)\n",g_options.maxcachemem);
-                 } else {
-                   u64 mbtemp1;
-                   u64 mbtemp2;
-                   mbtemp1 = (g_options.maxcachemem * (u64) 1045876);
-                   mbtemp2 = (s64) (mbtemp1 / g_options.datablocksize);
-                   msgprintf(MSG_FORCE, "System real ram calculated as %ldMB\n",memreal);
-                   msgprintf(MSG_FORCE, "Implemented -M requested block cache of size %ldMB\n",g_options.maxcachemem);
-                   g_options.maxcacheblocks = mbtemp2;
-                   queue_resize(&g_queue, g_options.maxcacheblocks);
-                 }
-            } 
+    memset(memdatabuf, 0, sizeof(memdatabuf));
+    // The checksum will be in the obj-header not in a file footer
+    if (((memfd=open("/proc/meminfo", O_RDONLY))<0) ||
+        ((memres=read(memfd, memdatabuf, sizeof(memdatabuf)-1 ))<16)) {   
+        errprintf("Cannot open /proc/meminfo for reading memory size\n");
+        memerr=true;
+        if (memfd >= 0) close(memfd);
+    } else { 
+        close(memfd);
+        if (((memszstr=strcasestr(memdatabuf,"MemTotal:")) == NULL) ||
+            ((memszstart=strspn(memszstr+9," \t")) < 1) ||
+            ((memszend=strspn(memszstr+9+memszstart,"0123456789")) < 1)) {
+               errprintf("Cannot find MemTotal value in /proc/meminfo\n");
+               memerr=true;
+        } else {
+             *(memszstr + 9 + memszstart + memszend)='\0';
+             char memunit = *(memszstr + 9 + memszstart + memszend + 1);
+             memsztemp = (u64)atoll(memszstr+9+memszstart);
+             if (memsztemp < 1) memsztemp = 1;
+             switch (memunit) {
+                 case 'b':
+                 case 'B':
+                     memreal = memsztemp / (u64) 1048576LL;
+                     break;
+                 case 'g':
+                 case 'G':
+                     memreal = memsztemp * (u64) 1024LL;
+                     break;
+                 case 'm':
+                 case 'M':
+                     memreal = memsztemp;
+                     break;
+                 case 'k':
+                 case 'K':
+                 default: 
+                     memreal = memsztemp / (u64)1024LL;
+                     break;
+             }
         }
+        if (memreal < 1) {
+              msgprintf(MSG_FORCE, "System real ram computing as less than 1MB?!\n");
+              memerr=true;
+        }
+    }
+    if (memerr) {
+        errprintf("Ignoring -M, -J, and -B command-line arguments\n");
+        g_options.maxcachemem = 0;
+        g_options.jobs_pfreader=FSA_DEF_THREAD_OPEN_FD;
+        g_options.buffer_size_read=FSA_DEF_THREAD_READ_BUFSIZE;
+    } else {
+        // calculate max size of queue, based upon -M, -B, or -J options
+        if (g_options.maxcachemem > 0) {
+            if (memreal < g_options.maxcachemem) {
+                 msgprintf(MSG_FORCE, "System real ram %ldMB < -M request of %ldMB\n", memreal, g_options.maxcachemem);
+                 g_options.maxcachemem = memreal / 2;
+                 msgprintf(MSG_FORCE, "Setting -M request to %ldMB (1/2 of real memory)\n",g_options.maxcachemem);
+            } else {
+                 u64 mbtemp1;
+                 u64 mbtemp2;
+                 mbtemp1 = (g_options.maxcachemem * (u64) 1045876);
+                 mbtemp2 = (s64) (mbtemp1 / g_options.datablocksize);
+                 msgprintf(MSG_FORCE, "System real ram calculated as %ldMB\n",memreal);
+                 msgprintf(MSG_FORCE, "Implemented -M requested block cache of size %ldMB\n",g_options.maxcachemem);
+                 g_options.maxcacheblocks = mbtemp2;
+                 queue_resize(&g_queue, g_options.maxcacheblocks);
+            }
+        }
+        //Ensure there's at least 32MB of real memory left after all planed allocations...
+        if ( (g_options.jobs_pfreader * g_options.buffer_size_read) + g_options.maxcachemem > memreal -32 ) {
+            int tempint = (FSA_DEF_THREAD_OPEN_FD * FSA_DEF_THREAD_READ_BUFSIZE) + g_options.maxcachemem;
+            if (tempint > memreal-32) { // not enough mem for default -J, -B options with selected -M value
+                if (tempint - g_options.maxcachemem > memreal - 32) { //not even with default -M value?!!!!!
+                    msgprintf(MSG_FORCE, "Not enough real memory for 32MB for OS + default -M, -J, -B values?!\n");
+                    msgprintf(MSG_FORCE, "Setting -M, -J, -B and wishing you Good Luck running this...");
+                    g_options.maxcachemem = 0;
+                } else {
+                    msgprintf(MSG_FORCE, "Not enough real memory for 32MB for OS + default -J, -B values with -M=%ld\n", g_options.maxcachemem);
+                    g_options.maxcachemem = memreal-32 - (FSA_DEF_THREAD_OPEN_FD * FSA_DEF_THREAD_READ_BUFSIZE);
+                    msgprintf(MSG_FORCE, "Setting -J, -B to default values and -M to %ldMB", g_options.maxcachemem);
+                }
+            } else {
+                msgprintf(MSG_FORCE, "Setting -J, -B to default values and keeping -M at %ldMB", g_options.maxcachemem);
+            }
+            g_options.jobs_pfreader=FSA_DEF_THREAD_OPEN_FD;
+            g_options.buffer_size_read=FSA_DEF_THREAD_READ_BUFSIZE;
+        } else {
+            msgprintf(MSG_FORCE, "Implemented -B requested PER-THREAD read cache of size %dMB\n",g_options.buffer_size_read);
+            msgprintf(MSG_FORCE, "Implemented -J requested file open64() read threads: %d\n",g_options.jobs_pfreader);
+
+        }
+        g_options.buffer_size_read_bytes = g_options.buffer_size_read * 1048576;
     }
 
     // calculate threshold for small files that are compressed together

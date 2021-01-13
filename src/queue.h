@@ -72,6 +72,7 @@ struct s_queue
     s64                  curitemnum; // unique id given to every new item (block or header)
     u64                  itemcount; // how many items there are (headers + blocks)
     u64                  blkcount; // how many blocks items there are (items where type==QITEM_TYPE_BLOCK only)
+    u64                  blkmaxcntreached; //tracker for max blks buffered at any point during processing
     u64                  blkmax; // how many blocks items there can be before the queue is considered as full
     bool                 endofqueue; // set to true when no more data to put in queue (like eof): reader must stop
 };
@@ -91,6 +92,7 @@ s64  queue_count_status(struct s_queue *l, int status);
 s64  queue_is_first_item_ready(struct s_queue *q);
 s64  queue_check_next_item(cqueue *q, int *type, char *magic);
 s64  queue_count_items_todo(cqueue *q);
+s64  queue_get_blkmaxcntreached(cqueue *q);
 
 // modification functions
 s64  queue_add_block(cqueue *q, cblockinfo *blkinfo, int status);

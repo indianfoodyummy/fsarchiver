@@ -58,6 +58,7 @@ s64 queue_init(cqueue *q, s64 blkmax)
     q->itemcount=0;
     q->blkcount=0;
     q->blkmax=blkmax;
+    q->blkmaxcntreached=0;
     q->endofqueue=false;
     
     // ---- init pthread structures
@@ -214,6 +215,22 @@ s64 queue_count_status(cqueue *q, int status)
     return count;
 }
 
+s64 queue_get_blkmaxcntreached(cqueue *q)
+{
+    s64 itemcount;
+    
+    if (!q)
+    {   errprintf("q is NULL\n");
+        return FSAERR_EINVAL;
+    }
+
+    assert(pthread_mutex_lock(&q->mutex)==0);
+    itemcount = (s64) q->blkmaxcntreached;
+    assert(pthread_mutex_unlock(&q->mutex)==0);
+    
+    return itemcount;
+}
+
 // add a block at the end of the queue
 s64 queue_add_block(cqueue *q, cblockinfo *blkinfo, int status)
 {
@@ -248,6 +265,7 @@ s64 queue_add_block(cqueue *q, cblockinfo *blkinfo, int status)
     // wait while (queue-is-full) to let the other threads remove items first
     while (q->blkcount >= q->blkmax)
     {
+        q->blkmaxcntreached = q->blkmax;
         struct timespec t=get_timeout();
         pthread_cond_timedwait(&q->cond, &q->mutex, &t);
     }
@@ -265,6 +283,7 @@ s64 queue_add_block(cqueue *q, cblockinfo *blkinfo, int status)
     q->blkcount++;
     q->itemcount++;
     item->itemnum=q->curitemnum++;
+    if (q->blkcount > q->blkmaxcntreached) q->blkmaxcntreached = q->blkcount;
     
     assert(pthread_mutex_unlock(&q->mutex)==0);
     pthread_cond_broadcast(&q->cond);

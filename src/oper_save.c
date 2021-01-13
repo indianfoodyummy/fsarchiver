@@ -59,6 +59,7 @@
 #include "crypto.h"
 #include "error.h"
 #include "queue.h"
+#include "pfreader.h"
 
 #ifndef ENOATTR
 #define ENOATTR ENODATA
@@ -82,6 +83,20 @@ typedef struct s_devinfo
     bool        mountedbyfsa;
     int         fstype;
 } cdevinfo;
+
+typedef struct s_thread_pfrjobs_info {    /* Used as argument to thread_createar_save_file_fct() */
+           pthread_t thread_id;        /* ID returned by pthread_create() */
+           int       thread_num;       /* Application-defined thread # */
+	   int      *retval;           /* For returning success/failure indicatora value after pthread_join */
+           csavear  *save;             /* For passing in the Save file structure used by createar_save_file */
+           char *root;                 /* For passing in the fs mountpoint used by createar_save_file */
+           char *relpath;              /* For passing in the fs-specific path used by createar_save_file */
+           struct stat64 *statbuf;     /* For passing in the statbuf from  */
+           u64 *costeval;
+} thread_pfrjobs_info;
+
+pfreader g_pfreader;
+
 
 int createar_obj_regfile_multi(csavear *save, cdico *header, char *relpath, char *fullpath, u64 filesize)
 {
@@ -118,22 +133,24 @@ int createar_obj_regfile_multi(csavear *save, cdico *header, char *relpath, char
     gcry_md_hash_buffer(GCRY_MD_MD5, md5sum, databuf, filesize);
     dico_add_data(header, 0, DISKITEMKEY_MD5SUM, md5sum, 16);
     
+//NICK - have to create regmulti-specific mutex lock here 
     // if shared-block with many small files is full, push it to queue and make a new one
     if (regmulti_save_enough_space_for_new_file(&save->regmulti, filesize)==false)
     {
         if (regmulti_save_enqueue(&save->regmulti, &g_queue, save->fsid)!=0)
         {   errprintf("Cannot queue last block of small-files\n");
-            return -1;
+            ret=-1;
+        } else {
+            regmulti_empty(&save->regmulti);
         }
-        
-        regmulti_empty(&save->regmulti);
     }
     
     // copy current small file to the shared-block
-    if (regmulti_save_addfile(&save->regmulti, header, databuf, filesize)!=0)
+    if ((ret>=0) && (regmulti_save_addfile(&save->regmulti, header, databuf, filesize)!=0))
     {   errprintf("Cannot add small-file %s to regmulti structure\n", relpath);
-        return -1;
+        ret=-1;
     }
+//NICK - have to create mutex unlock here 
     
     return ret;
 }
@@ -169,6 +186,7 @@ int createar_obj_regfile_unique(csavear *save, cdico *header, char *relpath, cha
     queue_add_header(&g_queue, header, FSA_MAGIC_OBJT, save->fsid);
     
     msgprintf(MSG_DEBUG1, "backup_obj_regfile_unique(file=%s, size=%lld)\n", relpath, (long long)filesize);
+
     for (filepos=0; (filesize>0) && (filepos < filesize) && (get_interrupted()==false); filepos+=curblocksize)
     {
         remaining=filesize-filepos;
@@ -255,6 +273,159 @@ int createar_obj_regfile_unique(csavear *save, cdico *header, char *relpath, cha
     
 backup_obj_regfile_unique_error:
     close(fd);
+    return ret;
+}
+
+int createar_obj_regfile_unique_pfr(csavear *save, cdico *header, char *relpath, char *fullpath, u64 filesize) // large or empty files
+{
+    cdico *footerdico=NULL;
+    struct s_blockinfo blkinfo;
+    gcry_md_hd_t md5ctx;
+    u32 curblocksize;
+    bool eof=false;
+    u64 remaining;
+    char text[256];
+    u8 *origblock;
+    u8 *md5tmp;
+    u8 md5sum[16];
+    u64 filepos;
+    int ret=0;
+    int res;
+    char *memdatabuf[FSA_MAX_THREAD_OPEN_FD];
+    int i;
+    long thread_assignments[FSA_MAX_THREAD_OPEN_FD];
+    int thread_fd[FSA_MAX_THREAD_OPEN_FD];
+    long bytes_read_buffer[FSA_MAX_THREAD_OPEN_FD];
+    int data_ready[FSA_MAX_THREAD_OPEN_FD];
+    pthread_t thread_list[FSA_MAX_THREAD_OPEN_FD];
+
+    
+    if (gcry_md_open(&md5ctx, GCRY_MD_MD5, 0) != GPG_ERR_NO_ERROR)
+    {   errprintf("gcry_md_open() failed\n");
+        return -1;
+    }
+
+    for (i=0; i < g_options.jobs_pfreader; i++) { 
+        if ((memdatabuf[i]=malloc(g_options.buffer_size_read_bytes)) == NULL) {
+             msgprintf(MSG_FORCE,"Cannot malloc %dMB for memdatabuf[%d]\n",g_options.buffer_size_read,i);
+             exit(0);
+        } else {
+             memset(memdatabuf[i], 0, g_options.buffer_size_read_bytes);
+             thread_assignments[i] = -1;
+        }
+        if ((thread_fd[i]=open64(fullpath, O_RDONLY|O_LARGEFILE))<0) {
+            msgprintf(MSG_FORCE,"Cannot open %s for reading, %dth time\n",fullpath,i+1);
+        } 
+    }
+    pfreader_init(&g_pfreader, g_options.jobs_pfreader, thread_fd, thread_assignments, (char **) memdatabuf, g_options.buffer_size_read_bytes, bytes_read_buffer, data_ready);
+    
+    // write header with file attributes (only if open64() works)
+    queue_add_header(&g_queue, header, FSA_MAGIC_OBJT, save->fsid);
+    
+    msgprintf(MSG_DEBUG1, "backup_obj_regfile_unique_pfr(file=%s, size=%lld)\n", relpath, (long long)filesize);
+    for (i=0,ret=0; (ret==0) && (i < g_options.jobs_pfreader) && (i<FSA_MAX_THREAD_OPEN_FD); i++)
+    {
+        if ((ret = pthread_create(&thread_list[i], NULL, pfreader_thread_read_fct, &g_pfreader)) != 0)
+        {
+            sysprintf("pthread_create(pfreader_thread_read_fct) failed, exiting program\n");
+            fflush(stdout);
+            fflush(stderr);
+            exit(-1);
+       } 
+    }
+
+    for (filepos=0; (filesize>0) && (filepos < filesize) && (get_interrupted()==false); filepos+=curblocksize)
+    {
+        remaining=filesize-filepos;
+        curblocksize=min(remaining, g_options.datablocksize);
+        msgprintf(MSG_DEBUG2, "----> filepos=%lld, remaining=%lld, curblocksize=%lld\n", (long long)filepos, (long long)remaining, (long long)curblocksize);
+        
+        origblock=malloc(curblocksize);
+        if (!origblock)
+        {   errprintf("malloc(%ld) failed: cannot allocate data block\n", (long)origblock);
+            ret=-1;
+            goto backup_obj_regfile_unique_error_pfr;
+        }
+        
+        if (eof==false) // file has not been truncated: read the next block
+        {
+            if ((res=pfreader_get_next_block(&g_pfreader, origblock, (long)curblocksize)) !=curblocksize)
+            {   ret=-1;
+                if (res>=0 && res<curblocksize) // file has been truncated: pad with zeros
+                {   errprintf("file [%s] has been truncated to %lld bytes (original size: %lld): padding with zeros\n", 
+                        relpath, (long long)(filepos+res), (long long)filesize);
+                    eof=true; // set oef to true so that we don't try to read the next blocks
+                    memset(origblock+res, 0, curblocksize-res); // zero out remaining bytes
+                }
+                else if (res<0) // read error
+                {   sysprintf("Cannot read data block from %s, block=%ld and res=%ld\n", relpath, (long)curblocksize, (long)res);
+                    ret=-1;
+                    goto backup_obj_regfile_unique_error_pfr;
+                }
+            }
+        }
+        else // file has been truncated: write zero so that the contents and the length in the header are consistent
+        {
+            memset(origblock, 0, curblocksize);
+        }
+        
+        gcry_md_write(md5ctx, origblock, curblocksize);
+        
+        // add block to the queue
+        memset(&blkinfo, 0, sizeof(blkinfo));
+        blkinfo.blkrealsize=curblocksize;
+        blkinfo.blkdata=(char*)origblock;
+        blkinfo.blkoffset=filepos;
+        blkinfo.blkfsid=save->fsid;
+        if (queue_add_block(&g_queue, &blkinfo, QITEM_STATUS_TODO)!=0)
+        {   sysprintf("queue_add_block(%s) failed\n", relpath);
+            ret=-1;
+            goto backup_obj_regfile_unique_error_pfr;
+        }
+    }
+  
+    if (get_interrupted()==true)
+    {   errprintf("operation has been interrupted\n");
+        ret=-1;
+        goto backup_obj_regfile_unique_error_pfr;
+    }
+    
+    // write the footer with the global md5sum
+    if ((md5tmp=gcry_md_read(md5ctx, GCRY_MD_MD5))==NULL)
+    {   errprintf("gcry_md_read() failed\n");
+        ret=-1;
+        goto backup_obj_regfile_unique_error_pfr;
+    }
+    memcpy(md5sum, md5tmp, 16);
+    gcry_md_close(md5ctx);
+    
+    msgprintf(MSG_DEBUG1, "--> finished loop for file=%s, size=%lld, md5=[%s]\n", relpath, (long long)filesize, format_md5(text, sizeof(text), md5sum));
+    
+    // don't write the footer for empty files (checksum does not make sense --> don't waste space in the archive)
+    if (filesize>0)
+    {
+        if ((footerdico=dico_alloc())==NULL)
+        {   errprintf("dico_alloc() failed\n");
+            ret=-1;
+            goto backup_obj_regfile_unique_error_pfr;
+        }
+        dico_add_data(footerdico, 0, BLOCKFOOTITEMKEY_MD5SUM, md5sum, 16);
+        
+        if (queue_add_header(&g_queue, footerdico, FSA_MAGIC_FILF, save->fsid)!=0)
+        {   msgprintf(MSG_VERB2, "Cannot write footer for file %s\n", relpath);
+            ret=-1;
+            goto backup_obj_regfile_unique_error_pfr;
+        }
+    }
+    
+backup_obj_regfile_unique_error_pfr:
+    pfreader_set_end_of_pfreader(&g_pfreader, true);
+    for (i=0; (i<g_options.jobs_pfreader) && (i<FSA_MAX_THREAD_OPEN_FD); i++) {
+        if (pthread_join(thread_list[i], NULL) != 0) errprintf("pthread_join(thread_list[%d]) failed, ignoring...\n", i);
+        close(thread_fd[i]);
+        free(memdatabuf[i]);
+    }
+    pfreader_destroy(&g_pfreader);
     return ret;
 }
 
@@ -417,6 +588,10 @@ int createar_item_stdattr(csavear *save, char *root, char *relpath, struct stat6
     *filecost=FSA_COST_PER_FILE; // fixed cost per file
     concatenate_paths(fullpath, sizeof(fullpath), root, relpath);
     
+// NICK - will need to change to locking mechanism like:
+// u64 get_objectid { lock(); id = save->objectid++; unlock(); return id;}
+// that will allow you to trivially thread-parallelize all of the non-regfile (unique + multi)
+// and then you can difficult thread-parallelize regfiles (unique + multi)
     msgprintf(MSG_DEBUG2, "Adding [%.5lld]=[%s]\n", (long long)save->objectid, relpath);
     if (dico_add_u64(d, DICO_OBJ_SECTION_STDATTR, DISKITEMKEY_OBJECTID, (u64)(save->objectid)++)!=0)
     {   errprintf("dico_add_u64(DICO_OBJ_SECTION_STDATTR) failed\n");
@@ -522,7 +697,7 @@ int createar_item_stdattr(csavear *save, char *root, char *relpath, struct stat6
                 {   dico_add_string(d, DICO_OBJ_SECTION_STDATTR, DISKITEMKEY_HARDLINK, buffer);
                     *objtype=OBJTYPE_HARDLINK;
                 }
-                else // next link to thar inode will be an hard link
+                else // next link to that inode will be an hard link
                 {
                     dichl_add(save->dichardlinks, (u64)statbuf->st_rdev, (u64)statbuf->st_ino, relpath);
                 }
@@ -701,12 +876,22 @@ int createar_save_file(csavear *save, char *root, char *relpath, struct stat64 *
                 dico_destroy(dicoattr);
                 return 0; // error is not fatal, operation must continue
             }
-            if ((res=createar_obj_regfile_unique(save, dicoattr, relpath, fullpath, statbuf->st_size))!=0)
-            {   msgprintf(MSG_STACK, "backup_obj_regfile_unique(%s)=%d failed\n", relpath, res);
-                save->stats.err_regfile++;
-                return 0; // not a fatal error, oper must continue
+            // if big file and the customer requested threaded reads occur, handle with parallel/threaded file reads
+            if ((statbuf->st_size > 0) && (g_options.jobs_pfreader > FSA_DEF_THREAD_OPEN_FD)) {
+                if ((res=createar_obj_regfile_unique_pfr(save, dicoattr, relpath, fullpath, statbuf->st_size))!=0)
+                {   msgprintf(MSG_STACK, "backup_obj_regfile_unique(%s)=%d failed\n", relpath, res);
+                    save->stats.err_regfile++;
+                    return 0; // not a fatal error, oper must continue
+                }
+            // otherwise, handle as normal, single-threaded processing
+            } else {
+                if ((res=createar_obj_regfile_unique(save, dicoattr, relpath, fullpath, statbuf->st_size))!=0)
+                {   msgprintf(MSG_STACK, "backup_obj_regfile_unique(%s)=%d failed\n", relpath, res);
+                    save->stats.err_regfile++;
+                    return 0; // not a fatal error, oper must continue
+                }
             }
-            else
+            if (res == 0) 
             {   save->stats.cnt_regfile++;
             }
             break;
@@ -742,23 +927,19 @@ int createar_save_directory(csavear *save, char *root, char *path, u64 *costeval
     struct stat64 statbuf;
     struct dirent *dir;
     DIR *dirdesc;
-    int ret = 0;
-    char **arrayOFrelpath = NULL;
-    int arraylen = 0;
-    int arrayalloc = 0;
-    int i = 0;
+    int ret=0;
     
     // init
     concatenate_paths(fulldirpath, sizeof(fulldirpath), root, path);
     
     if (!(dirdesc=opendir(fulldirpath)))
-    {   sysprintf("cannot open directory %s, path length=%d\n", fulldirpath, (int) strlen(fulldirpath));
+    {   sysprintf("cannot open directory %s\n", fulldirpath);
         return 0; // not a fatal error, oper must continue
     }
     
     // backup the directory itself (important for the root of the filesystem)
     if (lstat64(fulldirpath, &statbuf)!=0)
-    {   sysprintf("cannot lstat64(%s), path length=%d\n", fulldirpath, (int) strlen(fulldirpath));
+    {   sysprintf("cannot lstat64(%s)\n", fulldirpath);
         ret=-1;
         goto backup_dir_err;
     }
@@ -796,54 +977,225 @@ int createar_save_directory(csavear *save, char *root, char *path, u64 *costeval
             continue;
         }
         
-        // add directories to a list of sub-directory names to be processed
-        // after non-directory objects in this directory
+        // backup contents before the directory itself so that the dir-attributes are written after the dir contents
         if (S_ISDIR(statbuf.st_mode))
         { 
-              if (arraylen >= arrayalloc) {
-                 int old_arrayalloc = arrayalloc;
-                 arrayalloc = arrayalloc + 1000;
-                 if ((arraylen > old_arrayalloc) ||
-                    ((arrayOFrelpath = (char **) realloc(arrayOFrelpath,(size_t) (arrayalloc*sizeof(char *)))) == NULL)) {
-                    ret=-1;
-                    goto backup_dir_err;
-                 } else {
-                    //msgprintf(MSG_FORCE,"About to extend array: arraylen=%d, arrayalloc=%d\n",arraylen, arrayalloc);
-		    for (int i=old_arrayalloc; i < arrayalloc; i++) arrayOFrelpath[i]=NULL;
-                 }
-              }
-              arraylen++;
-              arrayOFrelpath[arraylen - 1]=strndup(relpath,PATH_MAX-1);
-              //msgprintf(MSG_FORCE,"Adding Dir name to list: arrayloc=%d, string=%s\n",arraylen-1, arrayOFrelpath[arraylen-1]);
-              if (arrayOFrelpath[arraylen - 1] == NULL) {
-                  ret=-1;
-                  goto backup_dir_err;
-              }
-        }
-        else // not a directory
-        {
-            if (createar_save_file(save, root, relpath, &statbuf, costeval)!=0)
-            {   msgprintf(MSG_STACK, "createar_save_file in createar_save_directory(%s) failed\n", relpath);
-                ret=-1;
-                goto backup_dir_err;
-            }
-        }
-    }
-    // backup contents before the directory itself so that the dir-attributes are written after the dir contents
-    for (i=0; ((i < arraylen ) && (get_interrupted()==false));i++) {
-            //msgprintf(MSG_FORCE,"About to createar_save_directory: root=%s, relpath=%s, relpath length=%d\n", root, arrayOFrelpath[i], (int) strlen(arrayOFrelpath[i]));
-            if (createar_save_directory(save, root, arrayOFrelpath[i], costeval)!=0)
+            if (createar_save_directory(save, root, relpath, costeval)!=0)
             {   msgprintf(MSG_STACK, "createar_save_directory(%s) failed\n", relpath);
                 ret=-1;
                 goto backup_dir_err;
             }
-            free(arrayOFrelpath[i]);
+        }
+        else // not a directory
+        {
+            if (createar_save_file(save, root, relpath, &statbuf, costeval)!=0)
+            {   msgprintf(MSG_STACK, "createar_save_directory(%s) failed\n", relpath);
+                ret=-1;
+                goto backup_dir_err;
+            }
+        }
     }
-    free(arrayOFrelpath);
-    arrayOFrelpath = NULL;
-    arraylen = arrayalloc = 0;
     
 backup_dir_err:
+    closedir(dirdesc);
+    return ret;
+}
+
+
+int createar_save_directory_threaded(csavear *save, char *root, char *path, u64 *costeval)
+{
+    char fulldirpath[PATH_MAX];
+    char fullpath[PATH_MAX];
+    char relpath[PATH_MAX];
+    struct stat64 statbuf;
+    struct dirent *dir;
+    DIR *dirdesc;
+    int ret = 0;
+    char **arrayOFreldirpath = NULL;
+    int arraylen_dir = 0;
+    int arrayalloc_dir = 0;
+    char **arrayOFrelLGFILEpath = NULL;
+    int arraylen_LGFILE = 0;
+    int arrayalloc_LGFILE = 0;
+    struct stat64 **arrayOFstatbufLGFILE = NULL;
+    int i = 0;
+    pthread_t thread_pfr[FSA_MAX_THREAD_OPEN_FD];
+    int objtype;
+    
+    // init
+    concatenate_paths(fulldirpath, sizeof(fulldirpath), root, path);
+    
+    if (!(dirdesc=opendir(fulldirpath)))
+    {   sysprintf("cannot open directory %s, path length=%d\n", fulldirpath, (int) strlen(fulldirpath));
+        return 0; // not a fatal error, oper must continue
+    }
+    
+    // backup the directory itself (important for the root of the filesystem)
+    if (lstat64(fulldirpath, &statbuf)!=0)
+    {   sysprintf("cannot lstat64(%s), path length=%d\n", fulldirpath, (int) strlen(fulldirpath));
+        ret=-1;
+        goto backup_dir_err_pfr;
+    }
+    
+    // save info about the directory itself
+    if (createar_save_file(save, root, path, &statbuf, costeval)!=0)
+    {   errprintf("createar_save_file(%s,%s) failed\n", root, path);
+        ret=-1;
+        goto backup_dir_err_pfr;
+    }
+
+    for (i=0; i<FSA_MAX_THREAD_OPEN_FD; i++)
+    {
+        thread_pfr[i]=0;
+    }
+    
+    while (((dir = readdir(dirdesc)) != NULL) && (get_interrupted()==false))
+    {
+        // ---- ignore "." and ".." and ignore mount-points
+        if (strcmp(dir->d_name,".")==0 || strcmp(dir->d_name,"..")==0)
+            continue; // ignore "." and ".."
+        
+        // ---- calculate paths
+        concatenate_paths(relpath, sizeof(relpath), path, dir->d_name);
+        concatenate_paths(fullpath, sizeof(fullpath), fulldirpath, dir->d_name);
+        
+        // ---- get details about current file
+        if (lstat64(fullpath, &statbuf)!=0)
+        {   sysprintf("cannot lstat64(%s)\n", fullpath);
+            ret=-1;
+            goto backup_dir_err_pfr;
+        }
+        
+        // check the list of excluded files/dirs
+        if ((exclude_check(&g_options.exclude, dir->d_name)==true) // is filename excluded ?
+            || (exclude_check(&g_options.exclude, relpath)==true)) // is filepath excluded ?
+        {
+            if (costeval==NULL) // dont log twice (eval + real)
+                msgprintf(MSG_VERB2, "file/dir=[%s] excluded\n", relpath);
+            continue;
+        }
+        
+        // add directories to a list of sub-directory names to be processed
+        // after non-directory objects in this directory
+        if (S_ISDIR(statbuf.st_mode))
+        { 
+              if (arraylen_dir >= arrayalloc_dir) {
+                 int old_arrayalloc_dir = arrayalloc_dir;
+                 arrayalloc_dir = arrayalloc_dir + 1000;
+                 if ((arraylen_dir > old_arrayalloc_dir) ||
+                    ((arrayOFreldirpath = (char **) realloc(arrayOFreldirpath,(size_t) (arrayalloc_dir*sizeof(char *)))) == NULL)) {
+                    ret=-1;
+                    goto backup_dir_err_pfr;
+                 } else {
+		    for (int i=old_arrayalloc_dir; i < arrayalloc_dir; i++) arrayOFreldirpath[i]=NULL;
+                 }
+              }
+              arraylen_dir++;
+              arrayOFreldirpath[arraylen_dir - 1]=strndup(relpath,PATH_MAX-1);
+              if (arrayOFreldirpath[arraylen_dir - 1] == NULL) {
+                  ret=-1;
+                  goto backup_dir_err_pfr;
+              }
+        }
+        else // not a directory
+        {
+//NICK: Per "createar_std_attr(), Logic to determine "regular file" is:
+// if (((statbuf->st_mode & S_IFMT) == S_IFREG) && (statbuf->st_nlink==1)) {
+//    if ((statbuf->st_size > 0) && (statbuf->st_size < g_options.smallfilethresh)) 
+//       { objtype=OBJTYPE_REGFILEMULTI; } else { objtype=OBJTYPE_REGFILEUNIQUE; }
+// }
+// that gives us 5 classes: 
+//     dir (already parsed out into array for serial execution, although they could be parallelized, but would
+//          then potentially create extent fragmentation that could have been avoided),
+//     non-regfile, which can all be parsed 100% in parallel, because they just add header to queue,
+//                  as long as add_header to queue does locking on add
+//     regfile-multi, which can all be parsed in parallel with non-regfile, but which require a lock on shared block
+//                    for multi file use / add multi-block to queue + clear it + add content to block
+//     regfile, which includes all hardlink items for special processing + 0-byte files)
+//        subset 1 = non-hardlink files <= blocksize
+//                   these can be parallelized with non-reg + reg-multi
+//        subset 2 = hardlink files or files > blocksize
+//              these can only be parallelized within a single file, but probably only make sense to
+//              thread where filesize >=3 blocks, because of thread create/destroy/queue add sync overhead
+// create reader/writer threads for parallel processing of small files
+
+            objtype = OBJTYPE_NULL;
+            if (((statbuf.st_mode & S_IFMT) == S_IFREG) && (statbuf.st_nlink==1)) {
+               if ((statbuf.st_size > 0) && (statbuf.st_size < g_options.smallfilethresh)) 
+                  { objtype=OBJTYPE_REGFILEMULTI; } else { objtype=OBJTYPE_REGFILEUNIQUE; }
+            }
+            if ((objtype==OBJTYPE_REGFILEUNIQUE)&&(statbuf.st_size > g_options.datablocksize-1)) {
+                 if (arraylen_LGFILE >= arrayalloc_LGFILE) {
+                     int old_arrayalloc_LGFILE = arrayalloc_LGFILE;
+                     arrayalloc_LGFILE = arrayalloc_LGFILE + 1000;
+                     if ((arraylen_LGFILE > old_arrayalloc_LGFILE) ||
+                        ((arrayOFrelLGFILEpath = (char **) realloc(arrayOFrelLGFILEpath,(size_t) (arrayalloc_LGFILE*sizeof(char *)))) == NULL) ||
+                        ((arrayOFstatbufLGFILE = (struct stat64 **) realloc(arrayOFstatbufLGFILE,
+                                                                             (size_t) (arrayalloc_LGFILE*sizeof(struct stat64 *)))) == NULL)) {
+                        ret=-1;
+                        goto backup_dir_err_pfr;
+                     } else {
+                         for (int i=old_arrayalloc_LGFILE; i < arrayalloc_LGFILE; i++) {
+                             arrayOFrelLGFILEpath[i]=NULL;
+                             arrayOFstatbufLGFILE[i]=NULL;
+                         }
+                     }
+                 }
+                 arraylen_LGFILE++;
+                 arrayOFrelLGFILEpath[arraylen_LGFILE - 1]=strndup(relpath,PATH_MAX-1);
+                 arrayOFstatbufLGFILE[arraylen_LGFILE - 1]=malloc(sizeof(struct stat64));
+                 if ((arrayOFrelLGFILEpath[arraylen_LGFILE - 1] == NULL) ||
+                     (arrayOFstatbufLGFILE[arraylen_LGFILE - 1] == NULL)) {
+                     ret=-1;
+                     goto backup_dir_err_pfr;
+                 }
+                 *(arrayOFstatbufLGFILE[arraylen_LGFILE - 1]) = statbuf;
+            } else {
+                if (createar_save_file(save, root, relpath, &statbuf, costeval)!=0)
+                {   msgprintf(MSG_STACK, "createar_save_file in createar_save_directory(%s) failed\n", relpath);
+                    ret=-1;
+                    goto backup_dir_err_pfr;
+                }
+            }
+        }
+    }
+//    for (i=0; (i<g_options.jobs_pfreader) && (i<FSA_MAX_THREAD_OPEN_FD); i++)
+//        if (thread_pfr[i] && pthread_join(thread_pfr[i], NULL) != 0)
+//            errprintf("pthread_join(thread_pfr[%d]) failed\n", i);
+
+    // backup large files serially (with parallelization WITHIN the single file backup) before processing the directory entries
+    for (i=0; ((i < arraylen_LGFILE ) && (get_interrupted()==false));i++) {
+        if (costeval == NULL) 
+            msgprintf(MSG_VERB1,"About to backup large file: root=%s, relpath=%s, relpath length=%d\n", 
+                                root, arrayOFrelLGFILEpath[i], (int) strlen(arrayOFrelLGFILEpath[i]));
+        if (createar_save_file(save, root, arrayOFrelLGFILEpath[i], arrayOFstatbufLGFILE[i], costeval)!=0)
+            {   msgprintf(MSG_STACK, "createar_save_file in createar_save_directory(%s) failed\n", relpath);
+                ret=-1;
+                goto backup_dir_err_pfr;
+            }
+        free(arrayOFrelLGFILEpath[i]);
+        free(arrayOFstatbufLGFILE[i]);
+    }
+    free(arrayOFrelLGFILEpath);
+    free(arrayOFstatbufLGFILE);
+    arrayOFrelLGFILEpath = NULL;
+    arrayOFstatbufLGFILE = NULL;
+    arraylen_LGFILE = arrayalloc_LGFILE = 0;
+
+    // backup contents before the directory itself so that the dir-attributes are written after the dir contents
+    for (i=0; ((i < arraylen_dir ) && (get_interrupted()==false));i++) {
+        if (createar_save_directory(save, root, arrayOFreldirpath[i], costeval)!=0)
+        {   msgprintf(MSG_STACK, "createar_save_directory(%s) failed\n", arrayOFreldirpath[i]);
+            ret=-1;
+            goto backup_dir_err_pfr;
+        }
+        free(arrayOFreldirpath[i]);
+    }
+    free(arrayOFreldirpath);
+    arrayOFreldirpath = NULL;
+    arraylen_dir = arrayalloc_dir = 0;
+    
+backup_dir_err_pfr:
     closedir(dirdesc);
     return ret;
 }
@@ -862,7 +1214,11 @@ int createar_save_directory_wrapper(csavear *save, char *root, char *path, u64 *
         return -1;
     }
     
-    ret=createar_save_directory(save, root, path, costeval);
+    if (g_options.jobs_pfreader > FSA_DEF_THREAD_OPEN_FD) {
+        ret=createar_save_directory_threaded(save, root, path, costeval);
+    } else {
+        ret=createar_save_directory(save, root, path, costeval);
+    }
     
     // put all small files that are in the last block to the queue
     if (regmulti_save_enqueue(&save->regmulti, &g_queue, save->fsid)!=0)
@@ -1199,6 +1555,8 @@ int oper_save(char *archive, int argc, char **argv, int archtype)
     csavear save;
     int ret=0;
     int i;
+    struct timespec stime;
+    struct timespec etime;
     
     // init
     memset(&save, 0, sizeof(save));
@@ -1351,6 +1709,11 @@ int oper_save(char *archive, int argc, char **argv, int archtype)
     save.cost_current=0;
     save.objectid=0;
     
+    if (clock_gettime(CLOCK_REALTIME, &stime)==-1) {
+        errprintf("Error getting the start time\n");
+        stime.tv_sec = 0;
+    } 
+
     // copy contents to archive
     switch (archtype)
     {
@@ -1427,6 +1790,27 @@ do_create_success:
     }
     
     queue_set_end_of_queue(&g_queue, true); // other threads must not wait for more data from this thread
+
+    msgprintf(MSG_FORCE, "Allocated Queue Memory: %ld, Blocks: %ld, Max Blocks reached: %ld\n",
+                    g_options.maxcachemem, g_options.maxcacheblocks, queue_get_blkmaxcntreached(&g_queue));
+    long current_queue_count=0;
+    while ((current_queue_count=queue_count(&g_queue)) > 100) {
+        msgprintf(MSG_FORCE, "Queue items flushing to disk: %ld, next update in 10 seconds\n",current_queue_count);
+        sleep(10);
+    }
+    
+    if ((clock_gettime(CLOCK_REALTIME, &etime)==-1) || (stime.tv_sec == 0)) {
+        errprintf("Error getting the time...no time-based metrics available\n");
+    } else {
+        if (save.cost_global > 0) {
+            long totalMB = save.cost_global / 1048576;
+            long MBps = totalMB / (etime.tv_sec - stime.tv_sec);
+            msgprintf(MSG_FORCE, "finished processing %ld input bytes in %ld seconds = %ld MB/s\n", 
+                      save.cost_global, etime.tv_sec - stime.tv_sec, MBps);
+        } else {
+            msgprintf(MSG_FORCE, "finished processing in %ld seconds\n", etime.tv_sec - stime.tv_sec);
+        }
+    }
     
     for (i=0; (i<g_options.compressjobs) && (i<FSA_MAX_COMPJOBS); i++)
         if (thread_comp[i] && pthread_join(thread_comp[i], NULL) != 0)

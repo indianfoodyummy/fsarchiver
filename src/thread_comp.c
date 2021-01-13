@@ -102,6 +102,11 @@ int compress_block_generic(struct s_blockinfo *blkinfo)
                 blkinfo->blkcompalgo=COMPRESS_ZSTD;
                 break;
 #endif // OPTION_ZSTD_SUPPORT
+            case COMPRESS_NONE:
+                res=FSAERR_SUCCESS;
+                blkinfo->blkcompalgo=COMPRESS_ZSTD;
+                compsize = blkinfo->blkrealsize;
+                break;
             default:
                 free(bufcomp);
                 errprintf("unsupported compression algorithm: %d\n", compalgo);
